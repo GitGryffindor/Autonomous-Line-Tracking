@@ -1,0 +1,41 @@
+------------------------- Terminal 1 (Pi) -------------------------
+ros2 launch turtlebot3_bringup robot.launch.py
+
+
+------------------------- Terminal 2 (Pi) -------------------------
+killall -9 camera_node
+
+# start with RGB888
+1. sleep 2 && ros2 run camera_ros camera_node --ros-args \
+  -p width:=640 \
+  -p height:=480 \
+  -p pixel_format:=RGB888
+
+
+2. ros2 run camera_ros camera_node --ros-args -p width:=640 -p height:=480
+
+
+3. sleep 2 && ros2 run camera_ros camera_node --ros-args \
+  -p width:=640 -p height:=480 -p pixel_format:=RGB888 2>/dev/null
+
+
+
+------------------------- Terminal 3 (Pi) -------------------------
+python3 ~/Desktop/waffle_tracker.py --ros-args \
+  -p use_compressed:=false \
+  -p use_raw_fallback:=true \
+  -p force_nv12:=false \
+  -p preview_view:=false \
+  -p publish_preview:=true
+  
+------------------------- Terminal 4 (Remote) -------------------------
+ros2 run rqt_image_view rqt_image_view
+# select: /waffle_tracker/preview/compressed
+
+------------------------- Verify the topic is being published -------------------------
+ros2 topic list | grep waffle_tracker
+ros2 topic hz /waffle_tracker/preview/compressed
+
+
+ssh waffle@waffle.local
+waffle
