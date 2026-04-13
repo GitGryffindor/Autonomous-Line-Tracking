@@ -15,7 +15,7 @@ killall -9 camera_node
 2. ros2 run camera_ros camera_node --ros-args -p width:=640 -p height:=480
 
 
-3. sleep 2 && ros2 run camera_ros camera_node --ros-args \
+3.  sleep 2 && ros2 run camera_ros camera_node --ros-args \
   -p width:=640 -p height:=480 -p pixel_format:=RGB888 2>/dev/null
 
 

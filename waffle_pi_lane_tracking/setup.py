@@ -24,6 +24,7 @@ setup(
         'console_scripts': [
             'detect_lane = waffle_pi_lane_tracking.detect_lane:main',
             'control_robot = waffle_pi_lane_tracking.control_robot:main',
+            'line_tracking = waffle_pi_lane_tracking.line_tracking:main',
         ],
     },
 )

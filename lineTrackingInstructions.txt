@@ -1,0 +1,28 @@
+------------------------- Terminal 1 (Pi - SSH) -------------------------
+ros2 launch turtlebot3_bringup robot.launch.py
+
+
+------------------------- Terminal 2 (Pi - SSH) -------------------------
+# Start camera in native mode (NV21 — handled by line_tracking.py)
+ros2 run camera_ros camera_node --ros-args -p width:=640 -p height:=480
+
+
+------------------------- Terminal 3 (Pi - SSH) -------------------------
+# Build and Launch the state machine
+cd ~/Desktop/ROS2_workspace
+colcon build --packages-select waffle_pi_lane_tracking
+source install/setup.bash
+ros2 launch waffle_pi_lane_tracking line_tracking.launch.py
+
+
+------------------------- Terminal 4 (Laptop) -------------------------
+# View the camera and state transitions
+ros2 run rqt_image_view rqt_image_view
+# Select: /image_raw/compressed
+
+ros2 topic echo /cmd_vel
+
+
+------------------------- Verify Setup -------------------------
+ros2 node list | grep line_tracking
+ros2 topic echo /cmd_vel --once
