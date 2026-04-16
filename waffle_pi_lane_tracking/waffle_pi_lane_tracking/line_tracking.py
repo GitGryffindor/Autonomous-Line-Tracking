@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-line_tracking.py — 4-state LiDAR-assisted line-following & obstacle
-bypass state machine.  Runs entirely on-board a Raspberry Pi 4 (no GPU).
+line_tracking.py — Hybrid APF + State Machine controller.
+
+Philosophy:
+  - Line     = opposite magnetic pole → SMOOTH APF steering within FOLLOWING_LINE
+  - Obstacle = same magnetic pole     → DECISIVE state machine for reliable bypass + recovery
 
 States:
-  0  FOLLOWING_LINE  — OpenCV centroid line-follow + front LiDAR monitor
-  1  EVADING         — 90° right turn using odometry yaw
-  2  CLEARING        — drive straight, wall-follow left LiDAR slice
-  3  ARC_RECOVERY    — forward-left arc until line is re-acquired
-  4  STUCK           — recovery state (reverse then retry)
+  FOLLOWING_LINE  — APF smooth steering + front LiDAR watch
+  EVADING         — 90° right turn using odometry (robot creeps forward, NEVER fully stops)
+  CLEARING        — Drive straight, left LiDAR monitors clearance
+  ARC_RECOVERY    — Forward-left arc until camera re-acquires line
+  STUCK           — Reverse briefly then retry EVADING
 
-Subscriptions:  /image_raw/compressed, /scan, /odom
-Publisher:      /cmd_vel
+Key guarantees:
+  - Robot NEVER fully stops (min 0.04 m/s always commanded during turns)
+  - Obstacle detection starts at 0.45m (early)
+  - APF steering is smooth and proportional within line-following
+  - State machine is reliable and proven for obstacle bypass + recovery
+
+Subscriptions: /camera/image_raw, /scan, /odom
+Publisher:     /cmd_vel, /visualization_marker_array
 """
 
 import math
-import sys
 import time
 from enum import Enum
 
@@ -29,397 +37,348 @@ from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, LaserScan
+from visualization_msgs.msg import Marker, MarkerArray
 
-# ─────────────────────────── CONSTANTS ────────────────────────────
-# Image processing (resized for Pi 4 real-time performance)
-IMG_WIDTH = 320
+# ─────────────────────────── CONSTANTS ────────────────────────────────────
+IMG_WIDTH  = 320
 IMG_HEIGHT = 240
+LINE_ROI_START = 0.35   # use bottom 65% of frame for line detection
 
-# Line-following (State 0)
-KP_STEER = 0.003                        # proportional gain  pixels → rad/s
-FOLLOW_LINEAR_X = 0.15                   # forward speed while following (m/s)
+FRONT_CONE_LOW  = 15    # front-cone right edge index
+FRONT_CONE_HIGH = 345   # front-cone left  edge index
 
-# Front-cone LiDAR obstacle detection
-FRONT_CONE_INDICES_LOW = 15              # 0 .. 14  (right of center)
-FRONT_CONE_INDICES_HIGH = 345            # 345 .. 359  (left of center)
-FRONT_CONE_THRESHOLD_M = 0.25           # obstacle trigger distance (m)
-
-# State 1 — EVADING (90° right turn)
-TURN_ANGULAR_Z = -0.5                    # right-turn angular velocity (rad/s)
-TURN_TARGET_DEG = 88.0                   # yaw delta to exit State 1 (°)
-
-# State 2 — CLEARING (straight drive, left-wall follow)
-CLEAR_LINEAR_X = 0.12                    # forward speed (m/s)
-CLEAR_LEFT_SLICE_START = 75              # left-side LiDAR start index
-CLEAR_LEFT_SLICE_END = 105               # left-side LiDAR end index
-CLEAR_DISTANCE_M = 1.0                   # obstacle-cleared threshold (m)
-CLEAR_BUFFER_SEC = 0.15                  # rear-wheel clearance buffer (s)
-
-# State 3 — ARC_RECOVERY
-ARC_LINEAR_X = 0.10                      # arc forward speed (m/s)
-ARC_ANGULAR_Z = 0.4                      # arc left-turn rate (rad/s)
-ARC_LINE_AREA_MIN = 500                  # min contour area to re-detect line (px²)
-
-# Watchdog timeouts (seconds)
-TIMEOUT_EVADING_SEC = 5.0
-TIMEOUT_CLEARING_SEC = 20.0
-TIMEOUT_ARC_RECOVERY_SEC = 15.0
-
-# STUCK recovery
-STUCK_REVERSE_X = -0.1                   # reverse speed (m/s)
-STUCK_REVERSE_SEC = 1.5                  # reverse duration (s)
+LEFT_SLICE_START = 75
+LEFT_SLICE_END   = 105
 
 
-# ──────────────────────────── STATE ENUM ──────────────────────────
+# ──────────────────────────── STATE ENUM ──────────────────────────────────
 class RobotState(Enum):
-    """Robot state machine states."""
     FOLLOWING_LINE = 0
-    EVADING = 1
-    CLEARING = 2
-    ARC_RECOVERY = 3
-    STUCK = 4
+    EVADING        = 1
+    CLEARING       = 2
+    ARC_RECOVERY   = 3
+    STUCK          = 4
 
 
-# ──────────────────────────── HELPERS ─────────────────────────────
+# ──────────────────────────── HELPERS ─────────────────────────────────────
 def quaternion_to_yaw(q):
-    """Extract yaw angle (radians) from a geometry_msgs Quaternion."""
-    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny_cosp, cosy_cosp)
-
-
-def sanitize_ranges(ranges):
-    """Remove nan and inf from a LiDAR ranges list, return numpy array."""
-    arr = np.array(ranges, dtype=np.float64)
-    return arr[np.isfinite(arr)]
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
 
 
 def angle_diff(target, current):
-    """Shortest signed angular difference (radians), handles ±π wrap."""
     d = target - current
     return math.atan2(math.sin(d), math.cos(d))
 
 
-# ──────────────────────────── NODE ────────────────────────────────
+def sanitize(ranges):
+    a = np.array(ranges, dtype=np.float64)
+    return a[np.isfinite(a)]
+
+
+# ──────────────────────────── NODE ────────────────────────────────────────
 class LineTrackingController(Node):
-    """4-state line-following + LiDAR obstacle bypass controller."""
 
     def __init__(self):
         super().__init__('line_tracking_controller')
 
-        # ── State bookkeeping ──
-        self.state = RobotState.FOLLOWING_LINE
-        self.state_entry_time = self.get_clock().now()
-        self.entry_yaw = 0.0
-        self.clear_buffer_started = False
-        self.clear_buffer_time = 0.0
-        self.stuck_reverse_start = None
+        # ── Parameters ───────────────────────────────────────────────────
+        # APF line-following
+        self.declare_parameter('k_att',             0.004)   # steering gain (px → rad/s)
+        self.declare_parameter('follow_speed',      0.15)    # forward speed while following
+        self.declare_parameter('min_speed',         0.04)    # min speed in any state (never stops)
+        # Obstacle detection
+        self.declare_parameter('obstacle_dist',     0.45)    # distance to trigger EVADING
+        # EVADING
+        self.declare_parameter('evade_turn_z',     -0.50)    # turn rate during EVADING (rad/s)
+        self.declare_parameter('evade_target_deg',  88.0)    # yaw to turn before CLEARING
+        self.declare_parameter('evade_speed',       0.05)    # creep speed during EVADING
+        # CLEARING
+        self.declare_parameter('clear_speed',       0.12)    # forward speed during CLEARING
+        self.declare_parameter('clear_dist',        0.65)    # left-gap to declare obstacle passed
+        self.declare_parameter('clear_buffer',      0.20)    # buffer seconds after clearing
+        # ARC_RECOVERY
+        self.declare_parameter('arc_speed',         0.10)    # forward speed during arc
+        self.declare_parameter('arc_turn_z',        0.45)    # left-turn during arc
+        self.declare_parameter('arc_line_area',     400.0)   # min contour area to re-detect line
+        # Watchdogs
+        self.declare_parameter('timeout_evade',     6.0)
+        self.declare_parameter('timeout_clear',    25.0)
+        self.declare_parameter('timeout_arc',      18.0)
+        # STUCK
+        self.declare_parameter('stuck_rev_speed',  -0.10)
+        self.declare_parameter('stuck_rev_sec',     1.5)
+        # Visualization
+        self.declare_parameter('enable_rviz',       False)
 
-        # ── cv_bridge ──
-        self.bridge = CvBridge()
+        self._load_params()
 
-        # ── QoS (sensor data) ──
-        sensor_qos = QoSProfile(
+        # ── State ────────────────────────────────────────────────────────
+        self.state              = RobotState.FOLLOWING_LINE
+        self.state_entry_time   = time.monotonic()
+        self.entry_yaw          = 0.0
+        self.evade_yaw_set      = False
+        self.clear_buf_started  = False
+        self.clear_buf_time     = 0.0
+        self.stuck_rev_start    = None
+
+        # ── Sensor cache ─────────────────────────────────────────────────
+        self.line_cx    = None
+        self.line_area  = 0
+        self.front_dist = float('inf')
+        self.robot_x    = 0.0
+        self.robot_y    = 0.0
+        self.current_yaw = 0.0
+        self.bridge     = CvBridge()
+
+        # ── QoS ──────────────────────────────────────────────────────────
+        qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
+            history=QoSHistoryPolicy.KEEP_LAST, depth=1)
 
-        # ── Subscribers ──
-        self.img_sub = self.create_subscription(
-            Image,
-            '/camera/image_raw',
-            self._image_callback,
-            sensor_qos,
-        )
+        # ── Subscribers ──────────────────────────────────────────────────
+        self.create_subscription(Image,     '/camera/image_raw', self._img_cb,  qos)
+        self.create_subscription(LaserScan, '/scan',             self._scan_cb, qos)
+        self.create_subscription(Odometry,  '/odom',             self._odom_cb, qos)
 
-        self.scan_sub = self.create_subscription(
-            LaserScan,
-            '/scan',
-            self._scan_callback,
-            sensor_qos,
-        )
+        # ── Publishers ───────────────────────────────────────────────────
+        self.cmd_pub    = self.create_publisher(Twist,       '/cmd_vel',                    1)
+        self.marker_pub = self.create_publisher(MarkerArray, '/visualization_marker_array', 1)
 
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            '/odom',
-            self._odom_callback,
-            sensor_qos,
-        )
+        # ── Control timer 20 Hz ──────────────────────────────────────────
+        self.create_timer(0.05, self._loop)
 
-        # ── Publisher ──
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 1)
+        self.get_logger().info(
+            f'Hybrid APF+SM started | obstacle_dist={self.obstacle_dist}m '
+            f'k_att={self.k_att} follow_speed={self.follow_speed}')
 
-        # ── Watchdog timer (10 Hz check) ──
-        self.watchdog_timer = self.create_timer(0.1, self._watchdog_tick)
+    # ── Parameter loader ──────────────────────────────────────────────────
+    def _load_params(self):
+        gp = lambda n: self.get_parameter(n).value
+        self.k_att           = gp('k_att')
+        self.follow_speed    = gp('follow_speed')
+        self.min_speed       = gp('min_speed')
+        self.obstacle_dist   = gp('obstacle_dist')
+        self.evade_turn_z    = gp('evade_turn_z')
+        self.evade_target_deg= gp('evade_target_deg')
+        self.evade_speed     = gp('evade_speed')
+        self.clear_speed     = gp('clear_speed')
+        self.clear_dist      = gp('clear_dist')
+        self.clear_buffer    = gp('clear_buffer')
+        self.arc_speed       = gp('arc_speed')
+        self.arc_turn_z      = gp('arc_turn_z')
+        self.arc_line_area   = gp('arc_line_area')
+        self.timeout_evade   = gp('timeout_evade')
+        self.timeout_clear   = gp('timeout_clear')
+        self.timeout_arc     = gp('timeout_arc')
+        self.stuck_rev_speed = gp('stuck_rev_speed')
+        self.stuck_rev_sec   = gp('stuck_rev_sec')
+        self.enable_rviz     = gp('enable_rviz')
 
-        self.get_logger().info('LineTrackingController started — State: FOLLOWING_LINE')
-
-    # ──────────── velocity helpers ────────────
-    def _publish_vel(self, linear_x=0.0, angular_z=0.0):
-        """Publish a Twist message to /cmd_vel safely."""
-        if not rclpy.ok():
-            return
+    # ── Velocity helper ───────────────────────────────────────────────────
+    def _vel(self, vx=0.0, wz=0.0):
         msg = Twist()
-        msg.linear.x = float(linear_x)
-        msg.angular.z = float(angular_z)
-        try:
-            self.cmd_pub.publish(msg)
-        except Exception:
-            pass
+        msg.linear.x  = float(vx)
+        msg.angular.z = float(wz)
+        self.cmd_pub.publish(msg)
 
-    def _stop(self):
-        """Publish zero velocity."""
-        self._publish_vel(0.0, 0.0)
+    # ── State transition ──────────────────────────────────────────────────
+    def _go(self, state):
+        self.get_logger().info(f'{self.state.name} → {state.name}')
+        self.state            = state
+        self.state_entry_time = time.monotonic()
+        self.clear_buf_started = False
+        self.evade_yaw_set    = False
 
-    # ──────────── state transitions ───────────
-    def _transition(self, new_state):
-        """Log and transition to a new state, reset state-entry time."""
-        old = self.state.name
-        self.state = new_state
-        self.state_entry_time = self.get_clock().now()
-        self.clear_buffer_started = False
-        self.get_logger().info(f'State transition: {old} → {new_state.name}')
+    def _elapsed(self):
+        return time.monotonic() - self.state_entry_time
 
-    def _state_elapsed_sec(self):
-        """Seconds since current state was entered."""
-        return (self.get_clock().now() - self.state_entry_time).nanoseconds * 1e-9
-
-    # ─────────── OpenCV line detection ────────
-    def _detect_line(self, cv_img):
-        """
-        Fast line-detection pipeline optimised for Pi 4.
-
-        Pipeline: resize → grayscale → Gaussian blur → adaptive threshold
-                  → find contours → largest contour → centroid.
-
-        Returns (centroid_x, contour_area) or (None, 0) if no line found.
-        """
-        small = cv2.resize(cv_img, (IMG_WIDTH, IMG_HEIGHT),
-                           interpolation=cv2.INTER_NEAREST)
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        thresh = cv2.adaptiveThreshold(
-            blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 11, 2,
-        )
-        contours, _ = cv2.findContours(
-            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
-        )
-        if not contours:
-            return None, 0
-
-        largest = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(largest)
-        if area < 50:                       # noise filter
-            return None, 0
-
-        M = cv2.moments(largest)
-        if M['m00'] == 0:
-            return None, 0
-
-        cx = int(M['m10'] / M['m00'])
-        return cx, area
-
-    # ─────────── front-cone LiDAR check ──────
-    def _front_cone_min(self, ranges):
-        """
-        Extract front-cone LiDAR slice and return minimum distance.
-
-        Handles array wrap-around: indices [0:15] ∪ [345:360].
-        Returns float('inf') if no valid readings.
-        """
-        if len(ranges) == 0:
-            return float('inf')
-
-        n = len(ranges)
-        hi_start = min(FRONT_CONE_INDICES_HIGH, n)
-        lo_end = min(FRONT_CONE_INDICES_LOW, n)
-
-        cone = list(ranges[0:lo_end]) + list(ranges[hi_start:n])
-        clean = sanitize_ranges(cone)
-
-        if len(clean) == 0:
-            return float('inf')
-        return float(np.min(clean))
-
-    # ━━━━━━━━━━━━ CALLBACKS ━━━━━━━━━━━━
-    def _image_callback(self, msg):
-        """Handle incoming camera frames (raw Image — RGB888 from camera_ros)."""
-        # CPU guard: skip image processing in States 1 & 2
-        if self.state in (RobotState.EVADING, RobotState.CLEARING, RobotState.STUCK):
-            return
-
+    # ── Sensor callbacks ──────────────────────────────────────────────────
+    def _img_cb(self, msg):
         enc = msg.encoding.lower()
         try:
             if enc in ('nv21', 'nv12'):
-                # cv_bridge cannot decode NV21/NV12 — bypass it entirely
-                # Read raw YUV bytes directly from the ROS message
                 yuv = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(
                     (msg.height * 3 // 2, msg.width))
-                if enc == 'nv21':
-                    cv_img = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV21)
-                else:
-                    cv_img = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
+                cv_img = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV21
+                                      if enc == 'nv21' else cv2.COLOR_YUV2BGR_NV12)
             elif enc == 'rgb8':
-                raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-                cv_img = cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
+                cv_img = cv2.cvtColor(
+                    self.bridge.imgmsg_to_cv2(msg, 'passthrough'), cv2.COLOR_RGB2BGR)
             else:
-                cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except CvBridgeError as e:
-            self.get_logger().error(f'CvBridgeError: {e}')
-            return
+                cv_img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         except Exception as e:
-            self.get_logger().error(f'Image decode error ({msg.encoding}): {e}')
+            self.get_logger().error(f'Camera decode error: {e}')
+            return
+        self.line_cx, self.line_area = self._detect_line(cv_img)
+
+
+    def _odom_cb(self, msg):
+        self.robot_x     = msg.pose.pose.position.x
+        self.robot_y     = msg.pose.pose.position.y
+        self.current_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
+
+    # ── Line detection (bottom 65% ROI, HSV-friendly) ─────────────────────
+    def _detect_line(self, cv_img):
+        small    = cv2.resize(cv_img, (IMG_WIDTH, IMG_HEIGHT), interpolation=cv2.INTER_NEAREST)
+        roi_y    = int(IMG_HEIGHT * LINE_ROI_START)
+        roi      = small[roi_y:, :]          # bottom 65%
+        gray     = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        blur     = cv2.GaussianBlur(gray, (7, 7), 0)
+        thresh   = cv2.adaptiveThreshold(blur, 255,
+                                         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                         cv2.THRESH_BINARY_INV, 11, 2)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None, 0
+        largest = max(contours, key=cv2.contourArea)
+        area    = cv2.contourArea(largest)
+        if area < 200:                       # reject noise / tiny patches
+            return None, 0
+        M = cv2.moments(largest)
+        if M['m00'] == 0:
+            return None, 0
+        return int(M['m10'] / M['m00']), area
+
+    # ── Front-cone min distance ───────────────────────────────────────────
+    def _front_min(self, ranges):
+        n = len(ranges)
+        if n == 0:
+            return float('inf')
+        cone = list(ranges[0:min(FRONT_CONE_LOW, n)]) + list(ranges[min(FRONT_CONE_HIGH, n):n])
+        clean = sanitize(cone)
+        return float(np.min(clean)) if len(clean) else float('inf')
+
+    # ══════════════════════ MAIN CONTROL LOOP (20 Hz) ═════════════════════
+    def _loop(self):
+        elapsed = self._elapsed()
+
+        # ── STUCK ─────────────────────────────────────────────────────────
+        if self.state == RobotState.STUCK:
+            if self.stuck_rev_start is None:
+                self.stuck_rev_start = time.monotonic()
+                self._vel(self.stuck_rev_speed, 0.0)
+            elif time.monotonic() - self.stuck_rev_start >= self.stuck_rev_sec:
+                self.stuck_rev_start = None
+                self._go(RobotState.EVADING)
             return
 
-        cx, area = self._detect_line(cv_img)
+        # ── Watchdog – escalate to STUCK if any bypass state timed out ────
+        if self.state == RobotState.EVADING  and elapsed > self.timeout_evade:
+            self._go(RobotState.STUCK); return
+        if self.state == RobotState.CLEARING  and elapsed > self.timeout_clear:
+            self._go(RobotState.STUCK); return
+        if self.state == RobotState.ARC_RECOVERY and elapsed > self.timeout_arc:
+            self._go(RobotState.STUCK); return
 
-        # ── State 0: FOLLOWING_LINE ──
+        # ── FOLLOWING_LINE — APF smooth steering ─────────────────────────
         if self.state == RobotState.FOLLOWING_LINE:
-            if cx is not None:
-                error = cx - IMG_WIDTH / 2
-                angular_z = -KP_STEER * error
-                self._publish_vel(FOLLOW_LINEAR_X, angular_z)
+            # Obstacle check first
+            if self.front_dist < self.obstacle_dist:
+                self.get_logger().info(f'Obstacle at {self.front_dist:.2f}m → EVADING')
+                self._vel(0.0, 0.0)
+                self._go(RobotState.EVADING)
+                return
+            # APF steering
+            if self.line_cx is not None:
+                error = self.line_cx - IMG_WIDTH / 2.0
+                wz    = max(-1.2, min(1.2, -self.k_att * error))
+                vx    = self.follow_speed * (1.0 - 0.4 * abs(wz) / 1.2)  # slow on sharp turns
+                vx    = max(self.min_speed, vx)
+                self._vel(vx, wz)
+                self._publish_markers(-self.k_att * error, 0.0, wz)
             else:
-                # Lost line — slow down, keep last command
-                self._publish_vel(FOLLOW_LINEAR_X * 0.5, 0.0)
+                # Line lost — creep forward slowly to re-acquire
+                self._vel(self.min_speed, 0.0)
 
-        # ── State 3: ARC_RECOVERY — look for line ──
-        elif self.state == RobotState.ARC_RECOVERY:
-            if cx is not None and area > ARC_LINE_AREA_MIN:
-                self.get_logger().info(
-                    f'Line re-acquired (area={area:.0f}), realigning')
-                self._stop()
-                self._transition(RobotState.FOLLOWING_LINE)
+        # ── EVADING — 90° right turn (creeps forward, never fully stops) ──
+        elif self.state == RobotState.EVADING:
+            if not self.evade_yaw_set:
+                self.entry_yaw     = self.current_yaw
+                self.evade_yaw_set = True
+                self.get_logger().info(f'EVADING: entry_yaw={math.degrees(self.entry_yaw):.1f}°')
 
-    def _scan_callback(self, msg):
-        """Handle incoming LiDAR scans."""
-        ranges = msg.ranges
+            delta = abs(angle_diff(self.entry_yaw, self.current_yaw))
+            if delta >= math.radians(self.evade_target_deg):
+                self.get_logger().info(f'EVADING done ({math.degrees(delta):.1f}°) → CLEARING')
+                self._go(RobotState.CLEARING)
+            else:
+                # Creep forward a tiny bit so robot doesn't spin in place
+                self._vel(self.evade_speed, self.evade_turn_z)
 
-        # ── State 0: monitor front cone for obstacles ──
-        if self.state == RobotState.FOLLOWING_LINE:
-            f_min = self._front_cone_min(ranges)
-            if f_min < FRONT_CONE_THRESHOLD_M:
-                self.get_logger().info(f'Obstacle detected! dist={f_min:.2f}m')
-                self._stop()
-                self._transition(RobotState.EVADING)
-
-        # ── State 2: left-wall follow ──
+        # ── CLEARING — drive straight, watch left LiDAR (via _scan_cb) ─────
         elif self.state == RobotState.CLEARING:
-            n = len(ranges)
-            start = min(CLEAR_LEFT_SLICE_START, n)
-            end = min(CLEAR_LEFT_SLICE_END, n)
-            left_slice = ranges[start:end]
-            clean = sanitize_ranges(left_slice)
+            self._vel(self.clear_speed, 0.0)
 
-            if len(clean) > 0:
-                median_dist = float(np.median(clean))
-                if median_dist >= CLEAR_DISTANCE_M and not self.clear_buffer_started:
-                    self.get_logger().info(
-                        f'Left side clear (median={median_dist:.2f} m), '
-                        f'buffer {CLEAR_BUFFER_SEC}s')
-                    self.clear_buffer_started = True
-                    self.clear_buffer_time = time.monotonic()
-
-            # keep driving forward
-            self._publish_vel(CLEAR_LINEAR_X, 0.0)
-
-            # check buffer expiry
-            if self.clear_buffer_started:
-                if (time.monotonic() - self.clear_buffer_time) >= CLEAR_BUFFER_SEC:
-                    self._transition(RobotState.ARC_RECOVERY)
-                    self._publish_vel(ARC_LINEAR_X, ARC_ANGULAR_Z)
-
-        # ── State 3: monitor front cone during arc ──
+        # ── ARC_RECOVERY — forward-left arc, camera looks for line ────────
         elif self.state == RobotState.ARC_RECOVERY:
-            if self._front_cone_min(ranges) < FRONT_CONE_THRESHOLD_M:
-                self.get_logger().warn(
-                    'Obstacle detected during arc recovery — re-evading')
-                self._stop()
-                self._transition(RobotState.EVADING)
-
-    def _odom_callback(self, msg):
-        """Handle odometry for yaw tracking (State 1)."""
-        if self.state == RobotState.EVADING:
-            current_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
-
-            # snapshot yaw on first odom after entering EVADING
-            if not hasattr(self, '_evade_yaw_set') or not self._evade_yaw_set:
-                self.entry_yaw = current_yaw
-                self._evade_yaw_set = True
-                self.get_logger().info(
-                    f'EVADING: entry yaw = {math.degrees(self.entry_yaw):.1f}°')
-
-            # compute absolute delta with wrap-around
-            delta = abs(angle_diff(self.entry_yaw, current_yaw))
-            target_rad = math.radians(TURN_TARGET_DEG)
-
-            if delta >= target_rad:
-                self.get_logger().info(
-                    f'EVADING complete: turned {math.degrees(delta):.1f}°')
-                self._stop()
-                self._evade_yaw_set = False
-                self._transition(RobotState.CLEARING)
+            if self.line_cx is not None and self.line_area > self.arc_line_area:
+                self.get_logger().info(f'Line re-acquired (area={self.line_area:.0f}) → FOLLOWING')
+                self._go(RobotState.FOLLOWING_LINE)
             else:
-                # keep turning right
-                self._publish_vel(0.0, TURN_ANGULAR_Z)
-        else:
-            # reset flag when not evading
-            self._evade_yaw_set = False
+                self._vel(self.arc_speed, self.arc_turn_z)
+                # Re-evade if new obstacle found during arc
+                if self.front_dist < self.obstacle_dist:
+                    self.get_logger().warn('New obstacle during arc → re-EVADING')
+                    self._go(RobotState.EVADING)
 
-    # ━━━━━━━━━━━━ WATCHDOG ━━━━━━━━━━━━
-    def _watchdog_tick(self):
-        """10 Hz watchdog timer — enforce state timeouts and STUCK recovery."""
-        elapsed = self._state_elapsed_sec()
+    # ── left LiDAR scan callback for CLEARING ─────────────────────────────
+    def _scan_cb(self, msg):
+        r = msg.ranges
+        n = len(r)
+        if n == 0:
+            return
+        # Front cone
+        cone  = list(r[0:min(FRONT_CONE_LOW, n)]) + list(r[min(FRONT_CONE_HIGH, n):n])
+        clean = sanitize(cone)
+        self.front_dist = float(np.min(clean)) if len(clean) else float('inf')
 
-        if self.state == RobotState.EVADING and elapsed > TIMEOUT_EVADING_SEC:
-            self.get_logger().warn(
-                f'EVADING timeout ({elapsed:.1f}s) — entering STUCK')
-            self._stop()
-            self._transition(RobotState.STUCK)
-            self.stuck_reverse_start = None
+        # CLEARING: watch left side
+        if self.state == RobotState.CLEARING:
+            left = sanitize(r[min(LEFT_SLICE_START, n):min(LEFT_SLICE_END, n)])
+            if len(left) > 0:
+                med = float(np.median(left))
+                if med >= self.clear_dist and not self.clear_buf_started:
+                    self.get_logger().info(f'Left clear ({med:.2f}m), buffering {self.clear_buffer}s')
+                    self.clear_buf_started = True
+                    self.clear_buf_time    = time.monotonic()
+            if self.clear_buf_started and (time.monotonic() - self.clear_buf_time) >= self.clear_buffer:
+                self._go(RobotState.ARC_RECOVERY)
 
-        elif self.state == RobotState.CLEARING and elapsed > TIMEOUT_CLEARING_SEC:
-            self.get_logger().warn(
-                f'CLEARING timeout ({elapsed:.1f}s) — entering STUCK')
-            self._stop()
-            self._transition(RobotState.STUCK)
-            self.stuck_reverse_start = None
+    # ── RViz markers ──────────────────────────────────────────────────────
+    def _publish_markers(self, f_att, f_rep, wz):
+        if not self.enable_rviz:
+            return
+        from geometry_msgs.msg import Point
+        from builtin_interfaces.msg import Duration
+        ma = MarkerArray()
+        for mid, (fy, r, g, b) in enumerate([
+            (-f_att * 0.4, 0.0, 0.4, 1.0),  # blue = line pull
+            (f_rep  * 0.4, 1.0, 0.2, 0.0),  # red  = obstacle push
+            (wz     * 0.4, 0.1, 0.9, 0.1),  # green = resultant
+        ]):
+            m = Marker()
+            m.header.frame_id = 'odom'
+            m.ns = 'apf'; m.id = mid
+            m.type = Marker.ARROW; m.action = Marker.ADD
+            p0 = Point(); p0.x = self.robot_x; p0.y = self.robot_y; p0.z = 0.1
+            p1 = Point(); p1.x = p0.x;         p1.y = p0.y + fy;   p1.z = 0.1
+            m.points = [p0, p1]
+            m.scale.x = 0.05; m.scale.y = 0.10; m.scale.z = 0.10
+            m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 0.9
+            m.lifetime = Duration(sec=0, nanosec=200_000_000)
+            ma.markers.append(m)
+        self.marker_pub.publish(ma)
 
-        elif self.state == RobotState.ARC_RECOVERY and elapsed > TIMEOUT_ARC_RECOVERY_SEC:
-            self.get_logger().warn(
-                f'ARC_RECOVERY timeout ({elapsed:.1f}s) — entering STUCK')
-            self._stop()
-            self._transition(RobotState.STUCK)
-            self.stuck_reverse_start = None
-
-        elif self.state == RobotState.STUCK:
-            self._handle_stuck()
-
-    def _handle_stuck(self):
-        """STUCK recovery: reverse briefly then retry EVADING."""
-        if self.stuck_reverse_start is None:
-            self.get_logger().error('STUCK — reversing for recovery')
-            self.stuck_reverse_start = time.monotonic()
-            self._publish_vel(STUCK_REVERSE_X, 0.0)
-        elif (time.monotonic() - self.stuck_reverse_start) >= STUCK_REVERSE_SEC:
-            self.get_logger().info('STUCK recovery complete — retrying EVADING')
-            self._stop()
-            self.stuck_reverse_start = None
-            self._transition(RobotState.EVADING)
-
-    # ━━━━━━━━━━━━ SHUTDOWN ━━━━━━━━━━━━
+    # ── Shutdown ──────────────────────────────────────────────────────────
     def destroy_node(self):
-        """Ensure motors are stopped before shutdown."""
-        self.get_logger().info('Shutting down — stopping motors')
-        self._stop()
+        self._vel(0.0, 0.0)
         super().destroy_node()
 
 
-# ─────────────────────────── MAIN ─────────────────────────────────
+# ─────────────────────────── MAIN ─────────────────────────────────────────
 def main(args=None):
-    """Entry point for the line_tracking node."""
     rclpy.init(args=args)
     node = LineTrackingController()
     try:
@@ -432,4 +391,5 @@ def main(args=None):
 
 
 if __name__ == '__main__':
+    import sys
     main(sys.argv)

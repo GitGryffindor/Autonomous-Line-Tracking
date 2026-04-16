@@ -39,3 +39,7 @@ ros2 topic hz /waffle_tracker/preview/compressed
 
 ssh waffle@waffle.local
 waffle
+
+
+
+ros2 launch waffle_pi_lane_tracking line_tracking.launch.py obstacle_distance_m:=0.5 follow_linear_x:=0.12
