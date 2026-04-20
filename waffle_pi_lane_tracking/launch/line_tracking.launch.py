@@ -23,7 +23,7 @@ def generate_launch_description():
 
     args = [
         # APF / line-following
-        DeclareLaunchArgument('k_att',             default_value='0.004',  description='Steering gain (px→rad/s)'),
+        DeclareLaunchArgument('k_att',             default_value='0.010',  description='Steering gain (px→rad/s)'),
         DeclareLaunchArgument('follow_speed',       default_value='0.15',   description='Forward speed while following (m/s)'),
         DeclareLaunchArgument('min_speed',          default_value='0.04',   description='Min speed in any state (never stops)'),
         # Obstacle

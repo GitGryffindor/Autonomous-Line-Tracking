@@ -3,8 +3,9 @@ ros2 launch turtlebot3_bringup robot.launch.py
 
 
 ------------------------- Terminal 2 (Pi - SSH) -------------------------
-# Start camera in native mode (NV21 — handled by line_tracking.py)
-ros2 run camera_ros camera_node --ros-args -p width:=640 -p height:=480
+# Start camera with RGB888 (fixes NV21 colour decode, enables JPEG compression for rqt)
+ros2 run camera_ros camera_node --ros-args \
+  -p width:=640 -p height:=480 -p pixel_format:=RGB888
 
 
 ------------------------- Terminal 3 (Pi - SSH) -------------------------
