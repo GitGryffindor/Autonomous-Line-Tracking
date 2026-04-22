@@ -81,11 +81,13 @@ def _vel(self, vx=0.0, wz=0.0):
 
 ### Pros & Cons
 
-| Aspect | Rating |
-|--------|--------|
-| Implementation effort | ⭐ Very easy (~10 lines changed) |
-| Smoothness | ⭐⭐ Good — removes velocity jumps |
-| Risk of breaking existing logic | Very low |
+
+| Aspect                          | Rating                           |
+| ------------------------------- | -------------------------------- |
+| Implementation effort           | ⭐ Very easy (~10 lines changed)  |
+| Smoothness                      | ⭐⭐ Good — removes velocity jumps |
+| Risk of breaking existing logic | Very low                         |
+
 
 ---
 
@@ -185,19 +187,22 @@ flowchart LR
 
 ### Pros & Cons
 
-| Aspect | Rating |
-|--------|--------|
-| Smoothness | ⭐⭐⭐⭐ Best — completely continuous |
-| Implementation effort | ⭐⭐⭐ Significant (~100+ lines) |
-| Risk | Higher — fundamentally different approach |
+
+| Aspect                | Rating                                    |
+| --------------------- | ----------------------------------------- |
+| Smoothness            | ⭐⭐⭐⭐ Best — completely continuous         |
+| Implementation effort | ⭐⭐⭐ Significant (~100+ lines)             |
+| Risk                  | Higher — fundamentally different approach |
+
 
 ---
 
 ## Comparison Summary
 
-| Feature | Option A: Ramping | Option B: Curved Bypass | Option C: Full APF |
-|---------|-------------------|-------------------------|--------------------|
-| **Difficulty** | Easy | Moderate | Hard |
-| **Smoothness** | Good | Excellent | Best |
-| **Keeps SM?** | ✅ Yes | Partially | ❌ No |
-| **Recommended** | Quick win | Balanced | Research/Pro |
+
+| Feature         | Option A: Ramping | Option B: Curved Bypass | Option C: Full APF |
+| --------------- | ----------------- | ----------------------- | ------------------ |
+| **Difficulty**  | Easy              | Moderate                | Hard               |
+| **Smoothness**  | Good              | Excellent               | Best               |
+| **Keeps SM?**   | ✅ Yes             | Partially               | ❌ No               |
+| **Recommended** | Quick win         | Balanced                | Research/Pro       |
