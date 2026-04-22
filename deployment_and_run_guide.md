@@ -9,6 +9,8 @@ Run this command from the repository root on your laptop to transfer the ROS2 pa
 
 ```bash
 rsync -avz --exclude '.git' /home/aashish/line_tracking/Autonomous-Line-Tracking/waffle_pi_lane_tracking/ waffle@waffle.local:~/Desktop/ROS2_workspace/src/waffle_pi_lane_tracking
+
+scp -r waffle_pi_lane_tracking waffle@10.61.92.179:~/Desktop/ROS2_workspace/src/
 ```
 
 ---

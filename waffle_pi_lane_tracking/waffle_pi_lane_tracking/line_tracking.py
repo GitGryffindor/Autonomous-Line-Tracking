@@ -72,6 +72,92 @@ def sanitize(ranges):
     return a[np.isfinite(a)]
 
 
+def _ransac_line_filter(
+    pts: np.ndarray,
+    inlier_thresh: float = 0.015,
+    iterations: int = 40,
+) -> np.ndarray:
+    """Return only the points that lie on the dominant flat face."""
+    if len(pts) < 2:
+        return pts
+    best_mask = np.ones(len(pts), dtype=bool)
+    best_count = 0
+    for _ in range(iterations):
+        idx = np.random.choice(len(pts), 2, replace=False)
+        p1, p2 = pts[idx[0]], pts[idx[1]]
+        edge = p2 - p1
+        norm_len = np.linalg.norm(edge)
+        if norm_len < 1e-6:
+            continue
+        n = np.array([-edge[1], edge[0]]) / norm_len
+        dists = np.abs((pts - p1) @ n)
+        mask = dists < inlier_thresh
+        if mask.sum() > best_count:
+            best_count = mask.sum()
+            best_mask = mask
+    return pts[best_mask]
+
+
+def measure_box_width(
+    ranges,
+    angle_min: float,
+    angle_increment: float,
+    threshold: float = 0.6,
+    min_points: int = 5,
+) -> dict | None:
+    """
+    Precise flat-face width measurement for box-shaped obstacles.
+
+    Algorithm:
+      1. Convert obstacle arc to Cartesian XY.
+      2. RANSAC: keep only points on the dominant flat face.
+      3. SVD: find the face direction (1st principal component).
+      4. Project all inlier points onto that direction → width.
+
+    Returns dict with keys: width, distance, face_angle  (all in metres/radians)
+    or None if insufficient points.
+    """
+    pts = []
+    for i, r in enumerate(ranges):
+        if np.isfinite(r) and 0.01 < r < threshold:
+            angle = angle_min + i * angle_increment
+            pts.append((r * np.cos(angle), r * np.sin(angle)))
+
+    if len(pts) < min_points:
+        return None
+
+    pts = np.array(pts)
+
+    # RANSAC outlier removal
+    pts = _ransac_line_filter(pts)
+    if len(pts) < min_points:
+        return None
+
+    # SVD — find the dominant face direction
+    centroid = pts.mean(axis=0)
+    _, _, Vt = np.linalg.svd(pts - centroid)
+    face_dir  = Vt[0]   # along the face
+    face_norm = Vt[1]   # perpendicular to the face
+
+    # Make sure normal points toward the robot (origin)
+    if face_norm @ centroid < 0:
+        face_norm = -face_norm
+
+    # Project onto face direction → width
+    proj  = (pts - centroid) @ face_dir
+    width = float(proj.max() - proj.min())
+
+    # Distance = component of centroid along the face normal
+    distance   = float(abs(centroid @ face_norm))
+    face_angle = float(np.arctan2(face_dir[1], face_dir[0]))
+
+    return {
+        'width':      round(width,      4),
+        'distance':   round(distance,   4),
+        'face_angle': round(face_angle, 4),
+    }
+
+
 # ──────────────────────────── NODE ────────────────────────────────────────
 class LineTrackingController(Node):
 
@@ -121,14 +207,18 @@ class LineTrackingController(Node):
         self.stuck_rev_start    = None
 
         # ── Sensor cache ─────────────────────────────────────────────────
-        self.line_cx    = None
-        self.line_area  = 0
-        self.front_dist = float('inf')
-        self.robot_x    = 0.0
-        self.robot_y    = 0.0
-        self.current_yaw = 0.0
-        self.bridge     = CvBridge()
-        self.last_error = 0.0   # last known line error (px from centre) for lost-line search
+        self.line_cx           = None
+        self.line_area         = 0
+        self.front_dist        = float('inf')
+        self.obstacle_width    = None   # metres — SVD+RANSAC box width
+        self.obstacle_distance = None   # metres — perpendicular dist to face
+        self.obstacle_face_angle = None # radians — face tilt vs robot X-axis
+        self.robot_x           = 0.0
+        self.robot_y           = 0.0
+        self.current_yaw       = 0.0
+        self.bridge            = CvBridge()
+        self.last_error        = 0.0   # last known line error (px from centre)
+        self.bypass_amp_base   = None  # locked at bypass entry, reset after
 
         # ── QoS ──────────────────────────────────────────────────────────
         qos = QoSProfile(
@@ -354,17 +444,77 @@ class LineTrackingController(Node):
         elif self.state == RobotState.BYPASSING:
             progress = min(1.0, elapsed / self.bypass_time)
 
+            # ── Compute bypass amplitude once at entry via arctan geometry ──
+            # theta = atan2(width/2 + safety_margin, perpendicular_distance)
+            # This is the exact angle the robot must steer to clear the box edge.
+            # face_angle corrects for an angled approach (box not square-on).
+            #
+            #          Robot
+            #            |  ← distance (d)
+            #       _____|_____
+            #      |     |     |  ← box face
+            #      |   w/2+m   |
+            #      |___________|  w = obstacle_width
+            #
+            #  theta = atan2(w/2 + margin, d)  → required clearance angle
+            if self.bypass_amp_base is None:
+                SAFETY_MARGIN = 0.30   # 30 cm lateral safety buffer (increased by 0.2m)
+                D_FLOOR       = 0.20   # minimum planning distance (m)
+                               #   prevents tiny SVD distances from blowing up theta
+                AMP_MIN       = 0.20   # never less than this (rad/s)
+                AMP_MAX       = 1.50   # hard ceiling (rad/s)
+
+                if (self.obstacle_width is not None
+                        and self.obstacle_distance is not None
+                        and self.obstacle_distance > 0.01):
+
+                    w = self.obstacle_width
+                    # obstacle_distance from SVD is ALREADY perpendicular to the face.
+                    # No cos(face_angle) projection needed — that was wrong and caused
+                    # near-zero d when face_angle ≈ 90°, inflating theta massively.
+                    d = max(self.obstacle_distance, D_FLOOR)
+
+                    # Exact clearance angle:
+                    #
+                    #   Robot
+                    #     |── d ──|
+                    #     |       |‾‾‾‾‾‾‾‾‾|
+                    #             | w/2 + m  |  box edge
+                    #             |__________|
+                    #
+                    #   theta = atan2(w/2 + margin, d)
+                    #
+                    # For sinusoidal wz = A·sin(2π·t/T),
+                    # max heading swing = A·T/π  →  A = theta·π / T  (exact, no gain)
+                    theta   = math.atan2(w / 2.0 + SAFETY_MARGIN, d)
+                    amp_geo = theta * math.pi / self.bypass_time  # heading swing == theta
+                    self.bypass_amp_base = max(AMP_MIN, min(AMP_MAX, amp_geo))
+
+                    fa = self.obstacle_face_angle or 0.0
+                    self.get_logger().info(
+                        f'[BYPASS-GEO] w={w:.3f}m raw_d={self.obstacle_distance:.3f}m '
+                        f'plan_d={d:.3f}m face={math.degrees(fa):.1f}° '
+                        f'theta={math.degrees(theta):.1f}° '
+                        f'amp={self.bypass_amp_base:.3f} rad/s  '
+                        f'(swing≈{math.degrees(theta):.0f}°)')
+                else:
+                    self.bypass_amp_base = self.bypass_amp   # fallback
+                    self.get_logger().warn('[BYPASS-GEO] No width data — using default amp')
+
+            amp = self.bypass_amp_base
+
             # Look for line once we're past the halfway mark
             if progress > 0.5 and self.line_cx is not None and self.line_area > 400.0:
                 self.get_logger().info(f'Line re-acquired (area={self.line_area:.0f}) → FOLLOWING')
+                self.bypass_amp_base = None   # reset for next bypass
                 self._go(RobotState.FOLLOWING_LINE)
                 return
 
             # Sinusoidal steering: right (-wz) -> straight -> left (+wz)
-            wz = -self.bypass_amp * math.sin(progress * 2.0 * math.pi)
+            wz = -amp * math.sin(progress * 2.0 * math.pi)
 
             # Slow down slightly during sharpest turns
-            vx = self.bypass_speed * (1.0 - 0.3 * abs(wz) / self.bypass_amp)
+            vx = self.bypass_speed * (1.0 - 0.3 * abs(wz) / amp)
             vx = max(self.min_speed, vx)
 
             self._vel(vx, wz)
@@ -372,6 +522,7 @@ class LineTrackingController(Node):
             if progress >= 1.0:
                 # If bypass finishes without finding line, fallback to line searching
                 self.get_logger().warn('Bypass finished without seeing line → FOLLOWING (Search)')
+                self.bypass_amp_base = None   # reset for next bypass
                 self._go(RobotState.FOLLOWING_LINE)
 
     # ── front LiDAR scan callback ─────────────────────────────────────────
@@ -380,10 +531,43 @@ class LineTrackingController(Node):
         n = len(r)
         if n == 0:
             return
-        # Front cone
+
+        # ── Front-cone min distance ──────────────────────────────────────
         cone  = list(r[0:min(FRONT_CONE_LOW, n)]) + list(r[min(FRONT_CONE_HIGH, n):n])
         clean = sanitize(cone)
         self.front_dist = float(np.min(clean)) if len(clean) else float('inf')
+
+        # ── Box-width measurement (only when obstacle is close enough) ────
+        if self.front_dist < self.zone1_dist:
+            # Build a front-cone index list for angle computation
+            low_idx  = min(FRONT_CONE_LOW, n)
+            high_idx = min(FRONT_CONE_HIGH, n)
+            cone_ranges = list(r[0:low_idx]) + list(r[high_idx:n])
+
+            # angle_min for the stitched cone:
+            # indices 0..low_idx-1 map directly; high_idx..n-1 map to
+            # negative angles, so we pass msg fields and let measure_box_width
+            # handle the full scan — it will only pick up points < threshold.
+            result = measure_box_width(
+                msg.ranges,
+                msg.angle_min,
+                msg.angle_increment,
+                threshold=min(self.front_dist + 0.15, self.zone1_dist),
+            )
+            if result is not None:
+                self.obstacle_width      = result['width']
+                self.obstacle_distance   = result['distance']
+                self.obstacle_face_angle = result['face_angle']
+                self.get_logger().info(
+                    f'[WIDTH] box={self.obstacle_width:.3f}m  '
+                    f'dist={self.obstacle_distance:.3f}m  '
+                    f'face={math.degrees(self.obstacle_face_angle):.1f}°')
+            else:
+                self.obstacle_width      = None
+                self.obstacle_distance   = None
+                self.obstacle_face_angle = None
+        else:
+            self.obstacle_width = None
 
     # ── RViz markers ──────────────────────────────────────────────────────
     def _publish_markers(self, f_att, f_rep, wz):
