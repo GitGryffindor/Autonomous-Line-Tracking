@@ -44,8 +44,8 @@ IMG_WIDTH  = 320
 IMG_HEIGHT = 240
 LINE_ROI_START = 0.0    # use full frame for line detection (was 0.35 — caused blind spot)
 
-FRONT_CONE_LOW  = 15    # front-cone right edge index
-FRONT_CONE_HIGH = 345   # front-cone left  edge index
+FRONT_CONE_LOW  = 20    # front-cone right edge index
+FRONT_CONE_HIGH = 340   # front-cone left  edge index
 
 # ──────────────────────────── STATE ENUM ──────────────────────────────────
 class RobotState(Enum):
@@ -203,7 +203,6 @@ class LineTrackingController(Node):
         # ── State ────────────────────────────────────────────────────────
         self.state              = RobotState.FOLLOWING_LINE
         self.state_entry_time   = time.monotonic()
-        self.entry_yaw          = 0.0
         self.stuck_rev_start    = None
 
         # ── Sensor cache ─────────────────────────────────────────────────
@@ -276,8 +275,24 @@ class LineTrackingController(Node):
     # ── State transition ──────────────────────────────────────────────────
     def _go(self, state):
         self.get_logger().info(f'{self.state.name} → {state.name}')
+        prev                  = self.state
         self.state            = state
         self.state_entry_time = time.monotonic()
+
+        # ── Garbage collection on state exit ─────────────────────────────
+        # Clear bypass geometry leaving BYPASSING → next obstacle always
+        # starts with a fresh SVD/width measurement (no stale data).
+        if prev == RobotState.BYPASSING:
+            self.bypass_amp_base     = None
+            self.obstacle_width      = None
+            self.obstacle_distance   = None
+            self.obstacle_face_angle = None
+
+        # Reset stuck reverse timer on any STUCK entry/exit so a premature
+        # rescue can never leave a stale timestamp that fires too early.
+        if prev == RobotState.STUCK or state == RobotState.STUCK:
+            self.stuck_rev_start = None
+
 
     def _elapsed(self):
         return time.monotonic() - self.state_entry_time
@@ -403,7 +418,8 @@ class LineTrackingController(Node):
         # Fix: Only rescue if the path ahead is ACTUALLY clear, otherwise it instantly loops back to bypassing!
         if (self.state not in (RobotState.FOLLOWING_LINE, RobotState.STUCK, RobotState.HARD_STOP)
                 and self.front_dist > self.zone2_dist
-                and self.line_cx is not None and self.line_area > RESCUE_AREA):
+                and self.line_cx is not None and self.line_area > RESCUE_AREA
+                and elapsed > 1.5):
             self.get_logger().info(
                 f'RESCUE: large line (area={self.line_area:.0f}), path clear → FOLLOWING_LINE')
             self._go(RobotState.FOLLOWING_LINE)
@@ -457,7 +473,12 @@ class LineTrackingController(Node):
             #      |___________|  w = obstacle_width
             #
             #  theta = atan2(w/2 + margin, d)  → required clearance angle
-            if self.bypass_amp_base is None:
+            # Re-measure during early bypass (progress < 0.15 ≈ first 0.9 s of 6 s).
+            # This fixes the race-condition where obstacle_width is None at the exact
+            # tick of BYPASSING entry (LiDAR callback hadn't fired yet), causing the
+            # robot to silently fall back to the generic amp and miss the clearance
+            # geometry for 2nd/3rd obstacles. After early phase the value is locked.
+            if self.bypass_amp_base is None or progress < 0.15:
                 SAFETY_MARGIN = 0.30   # 30 cm lateral safety buffer (increased by 0.2m)
                 D_FLOOR       = 0.20   # minimum planning distance (m)
                                #   prevents tiny SVD distances from blowing up theta
@@ -490,15 +511,17 @@ class LineTrackingController(Node):
                     amp_geo = theta * math.pi / self.bypass_time  # heading swing == theta
                     self.bypass_amp_base = max(AMP_MIN, min(AMP_MAX, amp_geo))
 
+                    phase = 'LOCK' if progress >= 0.15 else f'early({progress:.2f})'
                     fa = self.obstacle_face_angle or 0.0
                     self.get_logger().info(
-                        f'[BYPASS-GEO] w={w:.3f}m raw_d={self.obstacle_distance:.3f}m '
+                        f'[BYPASS-GEO|{phase}] w={w:.3f}m raw_d={self.obstacle_distance:.3f}m '
                         f'plan_d={d:.3f}m face={math.degrees(fa):.1f}° '
                         f'theta={math.degrees(theta):.1f}° '
                         f'amp={self.bypass_amp_base:.3f} rad/s  '
                         f'(swing≈{math.degrees(theta):.0f}°)')
-                else:
-                    self.bypass_amp_base = self.bypass_amp   # fallback
+                elif self.bypass_amp_base is None:
+                    # Only use fallback if we have absolutely no geometry yet
+                    self.bypass_amp_base = self.bypass_amp
                     self.get_logger().warn('[BYPASS-GEO] No width data — using default amp')
 
             amp = self.bypass_amp_base
